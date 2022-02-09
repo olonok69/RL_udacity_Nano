@@ -163,6 +163,51 @@ class ReplayBuffer:
         """
         return len(self.memory)
 
+class ReplayBuffer_2:
+    """Fixed-size buffer to store experience tuples."""
+
+    def __init__(self, action_size, buffer_size, batch_size, seed):
+        """Initialize a ReplayBuffer object.
+        Params
+        ======
+            action_size (int): dimension of each action
+            buffer_size (int): maximum size of buffer
+            batch_size (int): size of each training batch
+            seed (int): random seed
+        """
+        self.action_size = action_size
+        self.memory = deque(maxlen=buffer_size)
+        self.batch_size = batch_size
+        self.experience = namedtuple("Experience", field_names=[
+                                     "state", "action", "reward", "next_state", "done"])
+        self.seed = random.seed(seed)
+
+    def add(self, state, action, reward, next_state, done):
+        """Add a new experience to memory."""
+        e = self.experience(state, action, reward, next_state, done)
+        self.memory.append(e)
+
+    def sample(self, device):
+        """Randomly sample a batch of experiences from memory."""
+        experiences = random.sample(self.memory, k=self.batch_size)
+
+        states = torch.from_numpy(
+            np.vstack([e.state for e in experiences if e is not None])).float().to(device)
+        actions = torch.from_numpy(
+            np.vstack([e.action for e in experiences if e is not None])).float().to(device)
+        rewards = torch.from_numpy(
+            np.vstack([e.reward for e in experiences if e is not None])).float().to(device)
+        next_states = torch.from_numpy(np.vstack(
+            [e.next_state for e in experiences if e is not None])).float().to(device)
+        dones = torch.from_numpy(np.vstack(
+            [e.done for e in experiences if e is not None]).astype(np.uint8)).float().to(device)
+
+        return states, actions, rewards, next_states, dones
+
+    def __len__(self):
+        """Return the current size of internal memory."""
+        return len(self.memory)
+
 class Batcher:
     '''
     Select random batches from the dataset passed
@@ -208,6 +253,101 @@ class Batcher:
         np.random.shuffle(indices)
         self.data = [d[indices] for d in self.data]
 
+class Memory:
+    def __init__(self, size, batch_size):
+        self.keys = ['advantages', 'states', 'log_probs_old', 'returns', 'actions']
+        self.size = size
+        self.batch_size = batch_size
+        self.reset()
+
+    def add(self, data):
+        for k, vs in data.items():
+            for i in range(vs.size()[0]):
+                getattr(self, k).append(vs[i].unsqueeze(0))
+
+    def reset(self):
+        for key in self.keys:
+            setattr(self, key, deque(maxlen=self.size))
+
+    def categories(self, keys=['advantages', 'states', 'log_probs_old', 'returns', 'actions']):
+        data = [list(getattr(self, k))[:] for k in keys]
+        return map(lambda x: torch.cat(x, dim=0), data)
+
+    def sample(self):
+        batch_indices = np.random.permutation(len(getattr(self, self.keys[0])))[:len(getattr(
+            self, self.keys[0])) // self.batch_size * self.batch_size].reshape(-1, self.batch_size)
+        return batch_indices
+
+class ReplayMemory:
+    def __init__(self, seed, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+        self.seed = random.seed(seed)
+        self.seed1 = np.random.seed(seed)
+
+    def push(self, state, action, reward, next_state, done):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (state, action, reward, next_state, done)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        state, action, reward, next_state, done = map(np.stack, zip(*batch))
+        ''' 
+        https://github.com/quantumiracle/SOTA-RL-Algorithms/blob/master/sac_v2_multiprocess.py
+        the * serves as unpack: sum(a,b) <=> batch=(a,b), sum(*batch) ;
+        zip: a=[1,2], b=[2,3], zip(a,b) => [(1, 2), (2, 3)] ;
+        the map serves as mapping the function on each list element: map(square, [2,3]) => [4,9] ;
+        np.stack((1,2)) => array([1, 2])
+        '''
+        return state, action, reward, next_state, done
+
+    def __len__(self):
+        return len(self.buffer)
+
+class Environment():
+    """Learning Environment."""
+
+    def __init__(self, file_name="./envs/Reacher_Windows_x86_64_20/Reacher_Windows_x86_64/Reacher.exe", no_graphics=True):
+        """Initialize parameters and build model.
+        Params
+        ======
+            file_name (string): unity environment file
+            no_graphics (boolean): Start environment with graphics
+        """
+        self.env = UnityEnvironment(file_name=file_name, no_graphics=no_graphics)
+        self.brain_name = self.env.brain_names[0]
+        self.brain = self.env.brains[self.brain_name]
+        self.reset()
+        self.action_space_size = self.brain.vector_action_space_size
+        self.state_size = len(self.info.vector_observations[0])
+        self.num_agents = len(self.info.agents)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, tb):
+        self.env.close()
+
+    def reset(self, train_mode=False):
+        self.info = self.env.reset(train_mode=train_mode)[self.brain_name]
+        return self.info
+
+    def step(self, action):
+        self.info = self.env.step(action)[self.brain_name]
+        return self.info
+
+def soft_update(target, source, tau):
+    for target_param, param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
+
+def hard_update(target, source):
+    for target_param, param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_(param.data)
+
+
 def plot_scores(scores , algo, num_episodes, mode):
     """
     plot scores and save to disk
@@ -230,6 +370,8 @@ def plot_scores(scores , algo, num_episodes, mode):
         text = "D4PG Agent"
     elif algo == "6":
         text = f"TD3 Agent 4 DQN with {mode}"
+    elif algo == "9":
+        text = f"PPO Agent {mode}"
 
     plt.figure(figsize=(16, 12))
     plt.subplot(111)
@@ -262,6 +404,8 @@ def plot_losses(losses , algo, num_episodes, type, mode):
         text = "D4PG Agent"
     elif algo == "6":
         text =  f"TD3 Agent 4 DQN with {mode}"
+    elif algo == "9":
+        text = f"PPO Agent {mode}"
 
     plt.figure(figsize=(16, 12))
     plt.subplot(111)

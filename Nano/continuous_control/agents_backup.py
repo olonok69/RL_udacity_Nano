@@ -1339,168 +1339,200 @@ class Agent_SAC():
         self.checkpoint_folder= checkpoint_folder
         self.scaler = GradScaler()
         self.gradient_clip = 5
-        self.seed = np.random.seed(4)
 
 
         # algo number
         self.algo = algo
         self.mode = mode
 
-        self.value_max_grad_norm = float('inf')
-        self.policy_max_grad_norm = float('inf')
+        self.policy_network = Policy_SAC(state_size=self.state_size, action_size=self.action_size,
+                                         n_agents=self.n_agents).to(self.device)
+        self.policy_optimizer = optim.Adam(self.policy_network.parameters(), lr=self.lr)
 
-        self.critic1 = QNetwork(self.seed, self.state_size, self.action_size, 256).to(device=self.device)
-        self.critic_optim1 = optim.Adam(self.critic1.parameters(), lr=lr)
-        self.critic2 = QNetwork(self.seed, self.state_size, self.action_size, 256).to(device=self.device)
-        self.critic_optim2 = optim.Adam(self.critic2.parameters(), lr=lr)
-        self.critic3 = QNetwork(self.seed, self.state_size, self.action_size, 256).to(device=self.device)
-        self.critic_optim3 = optim.Adam(self.critic3.parameters(), lr=lr)
-        self.critic4 = QNetwork(self.seed, self.state_size, self.action_size, 256).to(device=self.device)
-        self.critic_optim4 = optim.Adam(self.critic4.parameters(), lr=lr)
+        # Initialize Value Network
+        self.value_network_local = Value_SAC(state_size=self.state_size, action_size=self.action_size,
+                                             n_agents=self.n_agents).to(self.device)
+        self.value_network_target = Value_SAC(state_size=self.state_size, action_size=self.action_size,
+                                              n_agents=self.n_agents).to(self.device)
+        self.value_optimizer = optim.Adam(self.value_network_local.parameters(), lr=self.lr)
 
-        self.critic_target1 = QNetwork(self.seed, self.state_size, self.action_size, 256).to(self.device)
-        hard_update(self.critic_target1, self.critic1)
-        self.critic_target2 = QNetwork(self.seed, self.state_size, self.action_size, 256).to(self.device)
-        hard_update(self.critic_target2, self.critic2)
-        self.critic_target3 = QNetwork(self.seed, self.state_size, self.action_size, 256).to(self.device)
-        hard_update(self.critic_target3, self.critic3)
-        self.critic_target4 = QNetwork(self.seed, self.state_size, self.action_size, 256).to(self.device)
-        hard_update(self.critic_target4, self.critic4)
-
-
-
+        # Initialize Q Network
+        self.q_network_1 = Q_SAC(state_size=self.state_size, action_size=self.action_size,
+                                 n_agents=self.n_agents).to(self.device)
+        self.q_network_2 = Q_SAC(state_size=self.state_size, action_size=self.action_size,
+                                 n_agents=self.n_agents).to(self.device)
+        self.q_optimizer_1 = optim.Adam(self.q_network_1.parameters(), lr=self.lr)
+        self.q_optimizer_2 = optim.Adam(self.q_network_2.parameters(), lr=self.lr)
 
         # Initialize Replay Memory
-        #self.memory = ReplayBuffer_2(self.action_size, self.buffer_size, self.batch_size, 0)
-        self.memory = ReplayBuffer(device, action_size, self.buffer_size, self.batch_size, 0)
+        self.memory = ReplayBuffer_2(self.action_size, self.buffer_size, self.batch_size, 0)
 
-        self.target_entropy = -torch.prod(torch.Tensor(self.action_size).to(self.device)).item()
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
-        self.alpha_optim = optim.Adam([self.log_alpha], lr=0.001)
-
-        self.policy = GaussianPolicy(self.seed, self.state_size, self.action_size,
-                                     256).to(self.device)
-        self.policy_optim = optim.Adam(self.policy.parameters(), lr=0.0005)
+        self.value_criterion = nn.MSELoss()
+        self.soft_q_criterion1 = nn.MSELoss()
+        self.soft_q_criterion2 = nn.MSELoss()
 
         # Step counter
         self.step_counter = 0
         #self.writer = SummaryWriter()
 
-        self.policy_losses = []
-        self.alpha_losses = []
+        self.losses_actor = []
+        self.losses_critic = []
         # is train is  False , load trained model from folder
         if os.path.isfile(self.checkpoint_folder + f'checkpoint_policy_{self.algo}_{self.mode}.pth') \
             and self.train == False:
-            self.policy.load_state_dict(torch.load(self.checkpoint_folder +
+            self.policy_network.load_state_dict(torch.load(self.checkpoint_folder +
                                                            f'checkpoint_policy_{self.algo}_{self.mode}.pth'))
 
     def checkpoint(self, algo, folder):
-        torch.save(self.policy.state_dict(), folder + f'checkpoint_policy_{self.algo}_{self.mode}.pth')
+        torch.save(self.policy_network.state_dict(), folder + f'checkpoint_policy_{self.algo}_{self.mode}.pth')
 
     def reset(self):
         #self.model.reset_parameters()
         pass
 
+    def value_q(self, states, next_states, rewards, dones, network, gamma=.99):
+        return (rewards + self.gamma * (1 - dones) * network(next_states))
 
-    def select_action(self, state, eval=False):
-        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
-        if self.train == False:
-            _, _, action = self.policy.sample(state)
-        else:
-            action, _, _ = self.policy.sample(state)
-        action = torch.clamp(action, -1, 1)
-        return action.detach().cpu().numpy()[0]
+    def value_v(self, states, alpha=0.1):
+        actions, log_probs = self.sample_action(states)
+
+        q_target_1 = self.q_network_1(states, actions.detach())
+        q_target_2 = self.q_network_2(states, actions.detach())
+
+        return torch.min(q_target_1, q_target_2) - self.alpha * log_probs
+
+    def optimize_loss(self, loss, optimizer):
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    def write_loss_to_log(self, loss, name):
+        #self.writer.add_scalar(name, loss.detach().cpu().numpy())
+        pass
 
     def learn(self):
-        self.train =True
+
         for _ in range(self.gradient_steps):
 
-            state_batch, action_batch, reward_batch, next_state_batch, mask_batch = self.memory.sample()
+            states, actions, rewards, next_states, dones = self.memory.sample(self.device)
 
-            #print(next_state_batch.shape, state_batch.shape)
-            current_actions, logpi_s, _ = self.policy.sample(state_batch)
+            predicted_q_value1 = self.q_network_1(states, actions)
+            predicted_q_value2 = self.q_network_2(states, actions)
+            predicted_value = self.value_network_local(states)
 
-            target_alpha = (logpi_s + self.target_entropy).detach()
-            alpha_loss = -(self.log_alpha * target_alpha).mean()
-
-            self.alpha_optim.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optim.step()
-            alpha = self.log_alpha.exp()
-            # add loss
-            self.alpha_losses.append(alpha_loss)
+            new_action, log_prob, epsilon, mean, log_std = self.policy_network.evaluate(states, self.device)
 
 
+            target_value = self.value_network_target(next_states)
+            target_q_value = rewards + (1 - dones) * self.gamma * target_value
+            q_value_loss1 = self.soft_q_criterion1(predicted_q_value1, target_q_value.detach()).mean()
+            q_value_loss2 = self.soft_q_criterion2(predicted_q_value2, target_q_value.detach()).mean()
 
-            current_q_sa_a1 = self.critic1(state_batch, current_actions)
-            current_q_sa_a2 = self.critic2(state_batch, current_actions)
-            current_q_sa_b1 = self.critic3(state_batch, current_actions)
-            current_q_sa_b2 = self.critic4(state_batch, current_actions)
-            current_q_sa_a = torch.min(current_q_sa_a1, current_q_sa_b1)
-            current_q_sa_b = torch.min(current_q_sa_a2, current_q_sa_b2)
-            current_q_sa = torch.min(current_q_sa_a, current_q_sa_b)
-            policy_loss = (alpha * logpi_s - current_q_sa.detach()).mean()
+            # self.optimizer.zero_grad()
+            # self.scaler.scale(loss).backward()  # total loss
+            # # Unscales the gradients of optimizer's assigned params in-place
+            # self.scaler.unscale_(self.optimizer)
+            # nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)  # clip gradient
+            # self.scaler.step(self.optimizer)
+            # self.scaler.update()
 
+            self.q_optimizer_1.zero_grad()
+            self.scaler.scale(q_value_loss1).backward()
+            self.scaler.unscale_(self.q_optimizer_1)
+            nn.utils.clip_grad_norm_(self.q_network_1.parameters(), self.gradient_clip)  # clip gradient
+            self.scaler.step(self.q_optimizer_1)
+            self.scaler.update()
 
-            # Q loss
-            ap, logpi_sp, _ = self.policy.sample(next_state_batch)
-            q_spap_a1= self.critic_target1(next_state_batch, ap)
-            q_spap_a2 = self.critic_target2(next_state_batch, ap)
-            q_spap_b1 = self.critic_target3(next_state_batch, ap)
-            q_spap_b2 = self.critic_target4(next_state_batch, ap)
-            q_spap_a = torch.min(q_spap_a1, q_spap_a2)
-            q_spap_b = torch.min(q_spap_b1, q_spap_b2)
-            q_spap = torch.min(q_spap_a, q_spap_b) - alpha * logpi_sp
-            target_q_sa = (reward_batch + self.gamma * q_spap * (1 - mask_batch)).detach()
+            # q_value_loss1.backward()
+            # self.q_optimizer_1.step()
+            self.q_optimizer_2.zero_grad()
+            self.scaler.scale(q_value_loss2).backward()
+            self.scaler.unscale_(self.q_optimizer_2)
+            nn.utils.clip_grad_norm_(self.q_network_2.parameters(), self.gradient_clip)  # clip gradient
+            self.scaler.step(self.q_optimizer_2)
+            self.scaler.update()
+            # q_value_loss2.backward()
+            # self.q_optimizer_2.step()
 
-            q_sa_a1 = self.critic1(state_batch, action_batch)
-            q_sa_a2 = self.critic2(state_batch, action_batch)
-            q_sa_b1 = self.critic3(state_batch, action_batch)
-            q_sa_b2 = self.critic4(state_batch, action_batch)
+            # Training Value Function
+            predicted_new_q_value = torch.min(self.q_network_1(states, new_action), self.q_network_2(states, new_action))
+            target_value_func = predicted_new_q_value - log_prob.sum(dim=1, keepdim=True)* self.alpha
+            value_loss = self.value_criterion(predicted_value, target_value_func.detach()).mean()
 
-            qa_loss1 = (q_sa_a1 - target_q_sa).pow(2).mul(0.5).mean()
-            qa_loss2 = (q_sa_a2 - target_q_sa).pow(2).mul(0.5).mean()
-            qb_loss1 = (q_sa_b1 - target_q_sa).pow(2).mul(0.5).mean()
-            qb_loss2 = (q_sa_b2 - target_q_sa).pow(2).mul(0.5).mean()
+            self.losses_critic.append(value_loss.item())
+            #torch.nn.utils.clip_grad_norm_(self.value_network_local.parameters(), 1)
 
-            self.critic_optim1.zero_grad()
-            qa_loss1.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic1.parameters(),
-                                           self.value_max_grad_norm)
-            self.critic_optim1.step()
+            self.value_optimizer.zero_grad()
+            self.scaler.scale(value_loss).backward()
+            self.scaler.unscale_(self.value_optimizer)
+            nn.utils.clip_grad_norm_(self.value_network_local.parameters(), self.gradient_clip)  # clip gradient
+            self.scaler.step(self.value_optimizer)
+            self.scaler.update()
 
-            self.critic_optim2.zero_grad()
-            qa_loss2.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic2.parameters(),
-                                           self.value_max_grad_norm)
-            self.critic_optim2.step()
+            # value_loss.backward()
+            # self.value_optimizer.step()
 
-            self.critic_optim3.zero_grad()
-            qb_loss1.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic3.parameters(),
-                                           self.value_max_grad_norm)
-            self.critic_optim3.step()
+            # Training Policy Function
+            policy_loss = -(predicted_new_q_value -log_prob.sum(dim=1, keepdim=True)* self.alpha ).mean()
 
-            self.critic_optim4.zero_grad()
-            qb_loss2.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic4.parameters(),
-                                           self.value_max_grad_norm)
-            self.critic_optim4.step()
+            #torch.nn.utils.clip_grad_norm_(self.policy_network.parameters(), 1)
+            self.policy_optimizer.zero_grad()
+            self.scaler.scale(policy_loss).backward()
+            self.scaler.unscale_(self.policy_optimizer)
+            nn.utils.clip_grad_norm_(self.policy_network.parameters(), self.gradient_clip)  # clip gradient
+            self.scaler.step(self.policy_optimizer)
+            self.scaler.update()
 
-            self.policy_optim.zero_grad()
-            policy_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(),
-                                           self.policy_max_grad_norm)
-            self.policy_optim.step()
-            self.policy_losses.append(policy_loss)
+            # policy_loss.backward()
+            # self.policy_optimizer.step()
+
+            self.losses_actor.append(policy_loss.item())
+
+            # # Calculate V and Q targets
+            # y_q = self.value_q(states, next_states, rewards, dones, self.value_network_target).detach()
+            # y_v = self.value_v(states)
             #
-            soft_update(self.critic_target1, self.critic1, self.tau)
-            soft_update(self.critic_target2, self.critic2, self.tau)
-            soft_update(self.critic_target3, self.critic3, self.tau)
-            soft_update(self.critic_target4, self.critic4, self.tau)
-            return
+            # # Update Q-functions
+            # q_loss_1 = (self.q_network_1(states, actions) - y_q).pow(2).mean()
+            # #print(f" old {q_loss_1}")
+            # #
+            # #q_loss_1 = F.smooth_l1_loss(self.q_network_1(states, actions) , y_q).mean()
+            # self.optimize_loss(q_loss_1, self.q_optimizer_1)
+            # q_loss_2 = (self.q_network_2(states, actions) - y_q).pow(2).mean()
+            # #q_loss_2 = F.smooth_l1_loss(self.q_network_2(states, actions), y_q).mean()
+            #
+            # self.optimize_loss(q_loss_2, self.q_optimizer_2)
+            #
+            # # Update V-function
+            # v_loss = (self.value_network_local(states) - y_v.detach()).pow(2).mean()
+            # #v_loss = F.smooth_l1_loss(self.value_network_local(states), y_v.detach()).mean(dim=0)
+            #
+            # # Minimize the loss
+            # self.value_optimizer.zero_grad()
+            # v_loss.backward(retain_graph=True)
+            # torch.nn.utils.clip_grad_norm_(self.value_network_local.parameters(), 1)
+            # #v_loss.backward()
+            # self.value_optimizer.step()
+            #
+            # #self.optimize_loss(v_loss, self.value_optimizer)
+            # self.losses_critic.append(v_loss.item())
+            # # Update Policy-function
+            # p_actions, p_log_probs = self.sample_action(states)
+            #
+            # p_loss = (self.q_network_1(states, p_actions) - self.alpha * p_log_probs).mean()
+            # torch.nn.utils.clip_grad_norm_(self.policy_network.parameters(), 1)
+            # self.optimize_loss(p_loss, self.policy_optimizer)
+            #
+            # self.losses_actor.append(p_loss.item())
 
+            # update Value network
+            self.soft_update(self.value_network_local, self.value_network_target, self.tau)
 
+            # Write losses to tensorbord log
+            # self.write_loss_to_log(q_loss_1, 'rewards/q_loss_1')
+            # self.write_loss_to_log(q_loss_2, 'rewards/q_loss_2')
+            # self.write_loss_to_log(p_loss, 'rewards/p_loss')
+            # self.write_loss_to_log(v_loss, 'rewards/v_loss')
 
     def soft_update(self, local_model, target_model, tau=0.005):
         """Soft update model parameters.
@@ -1516,14 +1548,37 @@ class Agent_SAC():
                 self.tau * local_param.data + (1.0 - self.tau) * target_param.data)
 
     def step(self, states, actions, rewards, next_states, dones):
+        for i in range(states.shape[0]):
+            self.memory.add(states[i], actions[i], rewards[i], next_states[i], dones[i])
+            self.step_counter += 1
 
-        #for i in range(self.n_agents):
-        self.memory.add(states, actions, rewards, next_states, dones)
-        self.step_counter += 1
-
-        if self.step_counter >= self.target_update_interval and len(self.memory) > self.batch_size:
+        if self.step_counter >= self.target_update_interval and len(self.memory.memory) > self.batch_size:
             self.learn()
             self.step_counter = 0
+
+    def sample_action(self, state, epsilon=1e-6):
+        (mean, stddev) = self.policy_network(state)
+        sigma = torch.distributions.Normal(0, 1).sample()
+        action = mean + stddev * sigma
+        log_prob = torch.distributions.Normal(mean, stddev,validate_args=False).log_prob(action)
+
+        return torch.tanh(action), log_prob
+
+    def act(self, state, episode):
+        state = torch.from_numpy(state).float().to(self.device)
+        self.policy_network.eval()
+        with torch.no_grad():
+            mean, std = self.policy_network(state)
+        self.policy_network.train()
+
+        std = std.exp()
+        normal = Normal(mean, std)
+        z = normal.sample().to(self.device)
+        action = torch.tanh(z)
+        action = torch.clamp(action, -1, 1)
+
+        return action.detach().cpu().numpy()
+
 
 class soft_actor_critic_agent(object):
     def __init__(self, num_inputs, action_space,
@@ -1961,7 +2016,7 @@ def agent_train_ppo(env,brain_name, agent, n_agents ,algo, num_episodes):
 
     return all_scores, averages,   losses, agent.mode
 
-def agent_train_sac(env,brain_name, agent, n_agents ,algo, num_episodes, BATCH_SIZE):
+def agent_train_sac(env,brain_name, agent, n_agents ,algo, num_episodes):
 
     import progressbar as pb
     def interact(action, num_agents):
@@ -1992,18 +2047,12 @@ def agent_train_sac(env,brain_name, agent, n_agents ,algo, num_episodes, BATCH_S
         for t in range(t_max):
             frame_counter += 1
             if (frame_counter % 1000) != 0:
-                #actions = agent.act(states, i_episode)
-                actions = agent.select_action(states)
-                actions = np.clip(actions, -1, 1)
+                actions = agent.act(states, i_episode)
             else:
                 actions = np.random.randn(n_agents, action_size)
                 actions = np.clip(actions, -1, 1)
 
-
             next_states, rewards, dones = interact(actions, n_agents)
-
-            #if len(agent.memory) > BATCH_SIZE:
-            #print(len(agent.memory))
             agent.step(states, actions, rewards, next_states, dones)
             states = next_states
             score += rewards.mean()
